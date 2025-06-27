@@ -1,9 +1,7 @@
 services:
   - type: web
-    name: smart-telegram-bot
+    name: telegram-bot
     env: python
-    buildCommand: "pip install -r requirements.txt"
-    startCommand: "python main.py"
-    envVars:
-      - key: TELEGRAM_TOKEN
-        sync: false
+    plan: free
+    buildCommand: pip install -r requirements.txt
+    startCommand: python main.py
