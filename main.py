@@ -64,9 +64,9 @@ def handle_message(message):
         price = r.json().get("bitcoin", {}).get("usd", "N/A")
         bot.send_message(message.chat.id, f"💰 BTC Price: ${price}")
     else:
-        bot.send_message(message.chat.id, "⚠️ I didn't understand. Try:
+        bot.send_message(message.chat.id, """⚠️ I didn't understand. Try:
 - top crypto
 - top stocks
-- btc price")
+- btc price""")
 
 bot.polling()
