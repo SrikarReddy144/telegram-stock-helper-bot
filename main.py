@@ -38,12 +38,18 @@ def get_top_stocks():
 
 @bot.message_handler(commands=["start"])
 def send_welcome(message):
-    bot.send_message(message.chat.id, "🤖 Hello! I can show top crypto, top stocks, and price of BTC.
+    bot.send_message(message.chat.id, """🤖 Hello!
+I can show:
+- Top crypto
+- Top stocks
+- Price of any coin or stock
+
 Try:
-- top crypto
-- top stocks
-- btc price
-")
+- /btc
+- /topcrypto
+- /topstocks
+- or type something like `TSLA` or `eth`
+""")
 
 @bot.message_handler(func=lambda msg: True)
 def handle_message(message):
