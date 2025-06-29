@@ -1,146 +1,147 @@
 import os
-import telebot
+import re
+import time
 import requests
-from flask import Flask, request
+import yfinance as yf
 from dotenv import load_dotenv
+from flask import Flask, request
+from fuzzywuzzy import fuzz, process
+from telebot import TeleBot, types
 
 load_dotenv()
-
-BOT_TOKEN = os.getenv("BOT_TOKEN")
+TOKEN = os.getenv("BOT_TOKEN")
 SECRET_PATH = os.getenv("SECRET_PATH")
-BASE_URL = os.getenv("BASE_URL")
-STOCK_API_KEY = os.getenv("STOCK_API_KEY")
+BASE_URL = os.getenv("BASE_URL", "")
 
-bot = telebot.TeleBot(BOT_TOKEN)
+bot = TeleBot(TOKEN)
 app = Flask(__name__)
 
-alerts = {}  # Example: {("user_id", "btc"): 30000}
-
-
-# ✅ Basic command: /start
-@bot.message_handler(commands=["start"])
-def start(message):
-    bot.send_message(message.chat.id, "👋 Hi! I'm your smart crypto & stock bot. Try:\n\n- btc\n- show apple stock\n- /alert btc 30000")
-
-
-# ✅ BTC command
-@bot.message_handler(commands=["btc"])
-def btc_price(message):
-    price = get_crypto_price("bitcoin")
-    bot.send_message(message.chat.id, f"₿ BTC: ${price}" if price else "BTC not found.")
-
-
-# ✅ Stock command
-@bot.message_handler(commands=["stock"])
-def stock_command(message):
-    parts = message.text.split()
-    if len(parts) < 2:
-        bot.send_message(message.chat.id, "Usage: /stock AAPL")
-        return
-    symbol = parts[1].upper()
-    price = get_stock_price(symbol)
-    bot.send_message(message.chat.id, f"📈 {symbol}: ${price}" if price else "Stock not found.")
-
-
-# ✅ Top cryptos
-@bot.message_handler(commands=["top"])
-def top_cryptos(message):
+# Load CoinGecko coins list
+COIN_LIST = []
+COIN_NAME_MAP = {}
+def fetch_coin_list():
+    global COIN_LIST, COIN_NAME_MAP
     try:
-        res = requests.get("https://api.coingecko.com/api/v3/coins/markets", params={"vs_currency": "usd", "order": "market_cap_desc", "per_page": 10})
-        data = res.json()
-        reply = "💎 Top 10 Cryptos:\n"
-        for coin in data:
-            reply += f"{coin['symbol'].upper()}: ${coin['current_price']}\n"
-        bot.send_message(message.chat.id, reply)
-    except:
-        bot.send_message(message.chat.id, "Error getting top cryptos.")
+        r = requests.get("https://api.coingecko.com/api/v3/coins/list")
+        COIN_LIST = r.json()
+        COIN_NAME_MAP = {coin['name'].lower(): coin['id'] for coin in COIN_LIST}
+        COIN_NAME_MAP.update({coin['symbol'].lower(): coin['id'] for coin in COIN_LIST})
+    except Exception as e:
+        print("Error loading coin list:", e)
 
+fetch_coin_list()
 
-# ✅ Alert: /alert btc 30000
-@bot.message_handler(commands=["alert"])
-def set_alert(message):
-    parts = message.text.split()
-    if len(parts) < 3:
-        bot.send_message(message.chat.id, "Usage: /alert btc 30000")
-        return
-    asset = parts[1].lower()
-    try:
-        target = float(parts[2])
-        alerts[(message.chat.id, asset)] = target
-        bot.send_message(message.chat.id, f"🔔 Alert set for {asset.upper()} at ${target}")
-    except:
-        bot.send_message(message.chat.id, "Invalid amount.")
+alerts = {}
 
+def get_best_coin_match(query):
+    choices = list(COIN_NAME_MAP.keys())
+    match, score = process.extractOne(query.lower(), choices)
+    return COIN_NAME_MAP.get(match) if score > 70 else None
 
-# ✅ AI-style smart reply
-@bot.message_handler(func=lambda m: True)
-def smart_reply(message):
-    text = message.text.lower()
-    if "btc" in text or "bitcoin" in text:
-        return btc_price(message)
-    if "eth" in text:
-        return send_price(message, "ethereum")
-    if "sol" in text:
-        return send_price(message, "solana")
-    if "doge" in text:
-        return send_price(message, "dogecoin")
-    if "stock" in text or "show" in text:
-        words = text.split()
-        for word in words:
-            if word.isalpha() and len(word) <= 5:
-                return send_stock(message, word.upper())
-    bot.send_message(message.chat.id, "❓ I didn’t understand that. Try `/btc`, `/alert`, or `apple stock`.")
-
-
-# 🔧 Reusable functions
 def get_crypto_price(symbol):
-    try:
-        res = requests.get(f"https://api.coingecko.com/api/v3/simple/price", params={"ids": symbol, "vs_currencies": "usd"})
-        return res.json()[symbol]["usd"]
-    except:
+    coin_id = get_best_coin_match(symbol)
+    if not coin_id:
         return None
-
+    url = f"https://api.coingecko.com/api/v3/simple/price?ids={coin_id}&vs_currencies=usd"
+    r = requests.get(url).json()
+    return r.get(coin_id, {}).get("usd")
 
 def get_stock_price(symbol):
     try:
-        url = f"https://financialmodelingprep.com/api/v3/quote-short/{symbol}?apikey={STOCK_API_KEY}"
-        res = requests.get(url)
-        data = res.json()
-        return data[0]["price"] if data else None
+        stock = yf.Ticker(symbol.upper())
+        data = stock.history(period="1d")
+        if not data.empty:
+            return round(data["Close"].iloc[-1], 2)
     except:
-        return None
+        pass
+    return None
 
+def detect_intent(text):
+    t = text.lower()
+    if any(word in t for word in ["price", "value", "show", "get"]):
+        return "price"
+    elif any(word in t for word in ["alert", "notify", "ping", "remind"]):
+        return "alert"
+    return "unknown"
 
-def send_price(message, symbol):
-    price = get_crypto_price(symbol)
-    bot.send_message(message.chat.id, f"{symbol.upper()}: ${price}" if price else "Not found.")
+def parse_price(text):
+    numbers = re.findall(r'\d+\.?\d*', text.replace(',', ''))
+    return float(numbers[0]) if numbers else None
 
+@bot.message_handler(commands=['start', 'help'])
+def send_welcome(msg):
+    bot.send_message(msg.chat.id, "👋 Welcome! Send me messages like:\n- `btc price`\n- `goog price`\n- `alert doge 0.2`")
 
-def send_stock(message, symbol):
-    price = get_stock_price(symbol)
-    bot.send_message(message.chat.id, f"{symbol}: ${price}" if price else "Stock not found.")
+@bot.message_handler(commands=['btc'])
+def btc_price(msg):
+    price = get_crypto_price("btc")
+    bot.send_message(msg.chat.id, f"Bitcoin price: ${price}" if price else "Couldn't fetch BTC price.")
 
+@bot.message_handler(commands=['stock'])
+def stock_price(msg):
+    bot.send_message(msg.chat.id, "Send a stock symbol like `TSLA`, `AAPL`, or `GOOG`.")
 
-# ✅ Webhook route
-@app.route(f"/{SECRET_PATH}", methods=["GET", "POST"])
+@bot.message_handler(commands=['top'])
+def top_cryptos(msg):
+    try:
+        url = "https://api.coingecko.com/api/v3/coins/markets?vs_currency=usd&order=market_cap_desc&per_page=10&page=1"
+        r = requests.get(url).json()
+        text = "\n".join([f"{c['name']}: ${c['current_price']}" for c in r])
+        bot.send_message(msg.chat.id, f"🔥 Top 10 Cryptos:\n{text}")
+    except:
+        bot.send_message(msg.chat.id, "Failed to fetch top cryptos.")
+
+@bot.message_handler(func=lambda msg: True)
+def smart_handler(msg):
+    text = msg.text.strip()
+    intent = detect_intent(text)
+    symbol_match = re.search(r'\b[a-zA-Z]{2,10}\b', text)
+    symbol = symbol_match.group() if symbol_match else None
+    price = parse_price(text)
+
+    if not symbol:
+        bot.send_message(msg.chat.id, "❓ Please include a coin or stock name.")
+        return
+
+    if intent == "price":
+        crypto = get_crypto_price(symbol)
+        if crypto:
+            bot.send_message(msg.chat.id, f"{symbol.upper()} (crypto): ${crypto}")
+            return
+        stock = get_stock_price(symbol)
+        if stock:
+            bot.send_message(msg.chat.id, f"{symbol.upper()} (stock): ${stock}")
+            return
+        bot.send_message(msg.chat.id, f"❌ Couldn't find price for '{symbol}'")
+    elif intent == "alert":
+        if price:
+            alerts[(msg.chat.id, symbol.lower())] = price
+            bot.send_message(msg.chat.id, f"🔔 Alert set: {symbol.upper()} at ${price}")
+        else:
+            bot.send_message(msg.chat.id, "⚠️ Couldn't detect alert price.")
+    else:
+        bot.send_message(msg.chat.id, "🤖 I didn't understand. Try 'btc price' or 'alert shib 0.01'.")
+
+# Background checker (not suitable on free hosting — here for logic)
+def check_alerts():
+    while True:
+        for (cid, symbol), target in alerts.items():
+            crypto_price = get_crypto_price(symbol)
+            if crypto_price and crypto_price >= target:
+                bot.send_message(cid, f"🔔 {symbol.upper()} reached ${crypto_price} (≥ {target})")
+                alerts.pop((cid, symbol))
+        time.sleep(60)
+
+@app.route(f"/{SECRET_PATH}", methods=["POST"])
 def webhook():
-    if request.method == "GET":
-        bot.remove_webhook()
-        bot.set_webhook(url=f"{BASE_URL}/{SECRET_PATH}")
-        return "✅ Webhook set!", 200
-
     if request.method == "POST":
-        update = telebot.types.Update.de_json(request.stream.read().decode("utf-8"))
-        bot.process_new_updates([update])
-        return "OK", 200
+        bot.process_new_updates([types.Update.de_json(request.stream.read().decode("utf-8"))])
+        return "", 200
+    return "Method Not Allowed", 405
 
-
-# ✅ Flask home
-@app.route("/")
-def home():
-    return "🤖 Bot is running."
-
-
-# ✅ Run the app
+# Only set webhook when run directly (for Render)
 if __name__ == "__main__":
+    bot.remove_webhook()
+    full_url = f"{BASE_URL}/{SECRET_PATH}"
+    bot.set_webhook(url=full_url)
     app.run(host="0.0.0.0", port=10000)
