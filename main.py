@@ -1,142 +1,167 @@
 import os
-import requests
 from flask import Flask, request
-from dotenv import load_dotenv
 import telebot
-from fuzzywuzzy import fuzz
+import requests
+import yfinance as yf
+from fuzzywuzzy import fuzz, process
+from threading import Thread
+import time
 
-# Load environment variables
-load_dotenv()
+# Load secrets from environment
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 SECRET_PATH = os.getenv("SECRET_PATH")
-API_KEY = os.getenv("API_KEY")
-BASE_URL = os.getenv("BASE_URL", "")
+BASE_URL = f"https://{os.getenv('RENDER_EXTERNAL_HOSTNAME')}"
 
 bot = telebot.TeleBot(BOT_TOKEN)
 app = Flask(__name__)
 
-# --- Known Crypto and Stock Maps ---
-CRYPTO_MAP = {
-    "btc": "bitcoin", "eth": "ethereum", "doge": "dogecoin", "sol": "solana",
-    "ada": "cardano", "xrp": "ripple", "ltc": "litecoin", "bnb": "binancecoin"
-}
+# === In-Memory Alerts ===
+alerts = []
 
-STOCK_MAP = {
-    "aapl": "Apple", "goog": "Google", "msft": "Microsoft", "tsla": "Tesla",
-    "amzn": "Amazon", "meta": "Meta", "nflx": "Netflix", "nvda": "Nvidia"
-}
+# === Known cryptos for fuzzy matching ===
+COMMON_CRYPTOS = ["bitcoin", "ethereum", "dogecoin", "solana", "cardano", "shiba inu", "polkadot", "litecoin"]
 
-alerts = {}
+# === Helper Functions ===
 
-# --- Util: Fuzzy Extract Symbol ---
-def extract_symbol(text):
-    text = text.lower()
-    candidates = list(CRYPTO_MAP.keys()) + list(CRYPTO_MAP.values()) + list(STOCK_MAP.keys()) + list(STOCK_MAP.values())
-    best = max(candidates, key=lambda x: fuzz.partial_ratio(x, text))
-    if fuzz.partial_ratio(best, text) > 60:
-        return best
-    return None
-
-# --- Fetch Prices ---
-def get_crypto_price(symbol):
-    real_symbol = CRYPTO_MAP.get(symbol.lower(), symbol.lower())
-    url = f"https://api.coingecko.com/api/v3/simple/price?ids={real_symbol}&vs_currencies=usd"
+def get_crypto_price(query):
     try:
-        data = requests.get(url).json()
-        price = data[real_symbol]['usd']
-        return f"{real_symbol.title()} → ${price}"
+        response = requests.get("https://api.coingecko.com/api/v3/coins/markets", params={
+            "vs_currency": "usd",
+            "ids": query.lower()
+        })
+        data = response.json()
+        if isinstance(data, list) and len(data) > 0:
+            coin = data[0]
+            return f"{coin['name']} (${coin['symbol'].upper()}): ${coin['current_price']:,}"
+        return None
     except:
-        return "❌ Crypto not found."
+        return None
 
-def get_stock_price(symbol):
-    url = f"https://www.alphavantage.co/query?function=GLOBAL_QUOTE&symbol={symbol.upper()}&apikey={API_KEY}"
+def get_stock_price(ticker):
     try:
-        data = requests.get(url).json()
-        price = data["Global Quote"]["05. price"]
-        return f"{symbol.upper()} → ${price}"
+        stock = yf.Ticker(ticker)
+        price = stock.history(period="1d")["Close"].iloc[-1]
+        name = stock.info.get("shortName", ticker)
+        return f"{name} ({ticker.upper()}): ${price:.2f}"
     except:
-        return "❌ Stock not found."
+        return None
 
-# --- Commands ---
-@bot.message_handler(commands=['start'])
-def send_welcome(message):
-    bot.reply_to(message, "👋 Hi! Ask me for any stock or crypto price. Try:\n- btc\n- show apple\n- set alert btc 30000")
+def match_crypto(query):
+    match, score = process.extractOne(query.lower(), COMMON_CRYPTOS)
+    if score >= 60:
+        return match
+    return query
 
-@bot.message_handler(commands=['btc'])
-def btc_price(message):
-    bot.reply_to(message, get_crypto_price("btc"))
+def check_alerts_loop():
+    while True:
+        time.sleep(30)
+        for alert in alerts[:]:
+            name = alert["name"]
+            target = alert["price"]
+            chat_id = alert["chat_id"]
+            price = None
 
-@bot.message_handler(commands=['stock'])
-def stock_price(message):
-    parts = message.text.split()
-    if len(parts) > 1:
-        sym = parts[1].lower()
-        bot.reply_to(message, get_stock_price(sym))
-    else:
-        bot.reply_to(message, "⚠️ Use: /stock AAPL")
+            # Try crypto first
+            fixed = match_crypto(name)
+            result = get_crypto_price(fixed)
+            if result:
+                try:
+                    p = float(result.split("$")[-1].replace(",", ""))
+                    price = p
+                except:
+                    continue
+            else:
+                # Try stock
+                stock_result = get_stock_price(name.upper())
+                if stock_result:
+                    try:
+                        p = float(stock_result.split("$")[-1])
+                        price = p
+                    except:
+                        continue
 
-@bot.message_handler(commands=['top'])
-def top_cryptos(message):
-    url = "https://api.coingecko.com/api/v3/coins/markets?vs_currency=usd&order=market_cap_desc&per_page=5&page=1"
-    try:
-        data = requests.get(url).json()
-        reply = "\n".join([f"{coin['name']} ({coin['symbol'].upper()}): ${coin['current_price']}" for coin in data])
-        bot.reply_to(message, f"🔥 Top 5 Cryptos:\n{reply}")
-    except:
-        bot.reply_to(message, "❌ Couldn't fetch top coins.")
+            if price:
+                if (alert["above"] and price >= target) or (not alert["above"] and price <= target):
+                    bot.send_message(chat_id, f"🔔 Alert triggered!\n{name.upper()} is now at ${price} (target was ${target})")
+                    alerts.remove(alert)
 
-@bot.message_handler(commands=['alert'])
+# === Telegram Bot Handlers ===
+
+@bot.message_handler(commands=["start", "help"])
+def start_msg(message):
+    bot.reply_to(message, "👋 Hi! I can help you with crypto and stock prices.\n\nTry sending:\n- btc\n- price of apple\n- dogecoin\n- /alert btc 30000\n- /alert tsla below 150")
+
+@bot.message_handler(commands=["alert"])
 def set_alert(message):
     try:
         parts = message.text.split()
-        symbol, target = parts[1].lower(), float(parts[2])
-        alerts[symbol] = target
-        bot.reply_to(message, f"🔔 Alert set for {symbol.upper()} at ${target}")
+        if len(parts) < 3:
+            bot.reply_to(message, "⚠️ Usage: /alert <asset> <price> or /alert <asset> below <price>")
+            return
+
+        name = parts[1].lower()
+        if "below" in parts:
+            idx = parts.index("below")
+            price = float(parts[idx + 1])
+            above = False
+        else:
+            price = float(parts[2])
+            above = True
+
+        alerts.append({
+            "name": name,
+            "price": price,
+            "chat_id": message.chat.id,
+            "above": above
+        })
+        bot.reply_to(message, f"✅ Alert set for {name.upper()} {'above' if above else 'below'} ${price}")
     except:
-        bot.reply_to(message, "⚠️ Use: /alert btc 30000")
+        bot.reply_to(message, "❌ Couldn't set alert. Please check format.")
 
-# --- AI-style Free Messages ---
 @bot.message_handler(func=lambda m: True)
-def ai_response(message):
-    text = message.text.lower()
-    symbol = extract_symbol(text)
+def handle_query(message):
+    q = message.text.lower().strip()
 
-    if not symbol:
-        bot.reply_to(message, "❌ Sorry, I couldn’t understand which stock or coin you meant.")
+    # Handle known typo cases
+    if "btc" in q or "bitcoin" in q:
+        q = "bitcoin"
+    elif "eth" in q or "ether" in q:
+        q = "ethereum"
+
+    # Try crypto first
+    matched = match_crypto(q)
+    result = get_crypto_price(matched)
+    if result:
+        bot.reply_to(message, f"📈 {result}")
         return
 
-    if symbol in CRYPTO_MAP or symbol in CRYPTO_MAP.values():
-        bot.reply_to(message, get_crypto_price(symbol))
-    elif symbol in STOCK_MAP or symbol in STOCK_MAP.values():
-        sym = [k for k, v in STOCK_MAP.items() if v.lower() == symbol or k == symbol]
-        if sym:
-            bot.reply_to(message, get_stock_price(sym[0]))
-        else:
-            bot.reply_to(message, get_stock_price(symbol))
-    else:
-        bot.reply_to(message, "❌ I don’t know this asset.")
+    # Try as stock
+    words = q.split()
+    possible_tickers = [word.upper() for word in words if word.isalpha() and len(word) <= 5]
+    for ticker in possible_tickers:
+        stock_result = get_stock_price(ticker)
+        if stock_result:
+            bot.reply_to(message, f"📊 {stock_result}")
+            return
 
-# --- Flask Webhook ---
+    bot.reply_to(message, "❓ Sorry, I couldn't find anything for that. Try asking for BTC, ETH, TSLA, AAPL, DOGE, etc.")
+
+# === Flask Webhook ===
+
 @app.route(f"/{SECRET_PATH}", methods=["POST"])
 def webhook():
-    bot.process_new_updates([telebot.types.Update.de_json(request.stream.read().decode("utf-8"))])
-    return "OK", 200
+    if request.method == "POST":
+        bot.process_new_updates([telebot.types.Update.de_json(request.stream.read().decode("utf-8"))])
+        return "OK", 200
 
 @app.route("/", methods=["GET"])
-def home():
-    return "✅ Bot is alive!"
+def index():
+    return "Bot is alive!", 200
 
-# --- Webhook Setup ---
-import threading
-@bot.message_handler(commands=['setwebhook'])
-def manual_webhook(message):
-    bot.remove_webhook()
-    full_url = f"{BASE_URL}/{SECRET_PATH}"
-    bot.set_webhook(url=full_url)
-    bot.reply_to(message, f"✅ Webhook set to {full_url}")
+# === Start Everything ===
 
-# --- Start App ---
 if __name__ == "__main__":
-    threading.Thread(target=lambda: bot.remove_webhook()).start()
-    threading.Thread(target=lambda: bot.set_webhook(url=f"{BASE_URL}/{SECRET_PATH}")).start()
+    Thread(target=check_alerts_loop, daemon=True).start()
+    bot.remove_webhook()
+    bot.set_webhook(url=f"{BASE_URL}/{SECRET_PATH}")
     app.run(host="0.0.0.0", port=10000)
