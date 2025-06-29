@@ -1,120 +1,152 @@
 import os
-import telebot
-import requests
-import yfinance as yf
+import json
+import time
+import threading
 from flask import Flask, request
-from fuzzywuzzy import process
+import requests
+from dotenv import load_dotenv
+from fuzzywuzzy import fuzz
+
+load_dotenv()
+app = Flask(__name__)
 
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 SECRET_PATH = os.getenv("SECRET_PATH")
-bot = telebot.TeleBot(BOT_TOKEN)
-app = Flask(__name__)
+URL = f"https://api.telegram.org/bot{BOT_TOKEN}/sendMessage"
 
-COINS = {
-    'btc': 'bitcoin',
-    'eth': 'ethereum',
-    'doge': 'dogecoin',
-    'sol': 'solana',
-    'xrp': 'ripple',
-    'ada': 'cardano',
-    'ltc': 'litecoin',
-    'matic': 'polygon'
-}
-alerts = {}
+ALERTS_FILE = "alerts.json"
 
-# 🔹 Get crypto price
-def get_crypto_price(coin_id):
+if not os.path.exists(ALERTS_FILE):
+    with open(ALERTS_FILE, "w") as f:
+        json.dump([], f)
+
+def save_alert(user_id, asset, condition, value):
+    with open(ALERTS_FILE, "r") as f:
+        alerts = json.load(f)
+    alerts.append({
+        "user_id": user_id,
+        "asset": asset.upper(),
+        "condition": condition,
+        "value": value
+    })
+    with open(ALERTS_FILE, "w") as f:
+        json.dump(alerts, f)
+
+def get_crypto_price(symbol):
     try:
-        url = f"https://api.coingecko.com/api/v3/simple/price?ids={coin_id}&vs_currencies=usd"
-        res = requests.get(url, timeout=3)
-        return res.json()[coin_id]['usd']
+        response = requests.get(f"https://api.coingecko.com/api/v3/simple/price?ids={symbol.lower()}&vs_currencies=usd")
+        data = response.json()
+        return data[symbol.lower()]['usd']
     except:
         return None
 
-# 🔹 Get stock price
-def get_stock_price(ticker):
+def get_stock_price(symbol):
     try:
-        stock = yf.Ticker(ticker)
-        return round(stock.fast_info['lastPrice'], 2)
+        r = requests.get(f"https://query1.finance.yahoo.com/v7/finance/quote?symbols={symbol}")
+        data = r.json()
+        return data['quoteResponse']['result'][0]['regularMarketPrice']
     except:
         return None
 
-# 🔹 Detect crypto from any user text
-def extract_crypto(text):
-    all_keys = list(COINS.keys()) + list(COINS.values())
-    match, score = process.extractOne(text.lower(), all_keys)
-    if score >= 70:
-        return COINS.get(match, match)
+def smart_price_lookup(query):
+    if " " in query:
+        query = query.split(" ")[-1]
+    symbol = query.upper()
+    price = get_crypto_price(symbol)
+    if price:
+        return f"💰 {symbol} price: ${price}"
+    price = get_stock_price(symbol)
+    if price:
+        return f"📈 {symbol} stock: ${price}"
+    return "❓ Sorry, I couldn't find anything for that. Try BTC, ETH, TSLA, AAPL, etc."
+
+def parse_alert(text):
+    text = text.lower()
+    if "alert" in text or "notify" in text or "set" in text:
+        for word in text.split():
+            if word.replace('.', '', 1).isdigit():
+                value = float(word)
+                break
+        else:
+            return None
+
+        if "above" in text or "more" in text or "over" in text:
+            condition = ">"
+        elif "below" in text or "less" in text or "under" in text:
+            condition = "<"
+        else:
+            condition = ">"
+
+        for token in text.split():
+            if token.isalpha() and len(token) <= 6:
+                asset = token
+                break
+        else:
+            return None
+
+        return asset.upper(), condition, value
     return None
 
-# 🔹 Detect stock symbol from text
-def extract_stock(text):
-    words = text.upper().replace("$", "").split()
-    for word in words:
-        if len(word) <= 5 and word.isalpha():
-            price = get_stock_price(word)
-            if price:
-                return word, price
-    return None, None
-
-# 🟢 Telegram commands
-@bot.message_handler(commands=['start'])
-def start(message):
-    bot.reply_to(message, "👋 Ask me for crypto or stock prices. Try:\n- btc\n- show tsla\n- eth price\n- alert btc 30000")
-
-@bot.message_handler(commands=['alert'])
-def alert(message):
-    try:
-        _, coin, target = message.text.split()
-        target = float(target)
-        user = message.chat.id
-        alerts.setdefault(user, {})[coin.lower()] = target
-        bot.reply_to(message, f"🔔 Alert set for {coin.upper()} at ${target}")
-    except:
-        bot.reply_to(message, "❗ Usage: /alert btc 30000")
-
-@bot.message_handler(func=lambda m: True)
-def handle_query(message):
-    text = message.text.lower()
-
-    # Check for crypto
-    coin_id = extract_crypto(text)
-    if coin_id:
-        price = get_crypto_price(coin_id)
-        if price:
-            bot.reply_to(message, f"💰 {coin_id.title()} price: ${price}")
-            return
-
-    # Check for stock
-    symbol, price = extract_stock(text)
-    if symbol:
-        bot.reply_to(message, f"📊 {symbol.upper()} stock: ${price}")
-        return
-
-    bot.reply_to(message, "❓ Sorry, I couldn't find anything for that. Try BTC, ETH, TSLA, AAPL, etc.")
-
-# 🌐 Webhook routes
-@app.route(f"/{SECRET_PATH}", methods=["POST"])
-def webhook():
-    update = telebot.types.Update.de_json(request.stream.read().decode("utf-8"))
-    bot.process_new_updates([update])
-    return "OK", 200
-
-@app.route("/")
-def home():
-    return "Bot is running."
-
-# 🔁 Background alert checker
-import threading, time
 def check_alerts():
     while True:
-        for user, user_alerts in alerts.items():
-            for coin, target in list(user_alerts.items()):
-                current = get_crypto_price(COINS.get(coin, coin))
-                if current and current >= target:
-                    bot.send_message(user, f"🔔 {coin.upper()} hit ${current} (target was ${target})")
-                    alerts[user].pop(coin)
-        time.sleep(10)
+        with open(ALERTS_FILE, "r") as f:
+            alerts = json.load(f)
+
+        new_alerts = []
+        for alert in alerts:
+            user_id = alert["user_id"]
+            asset = alert["asset"]
+            condition = alert["condition"]
+            value = alert["value"]
+
+            price = get_crypto_price(asset) or get_stock_price(asset)
+            if price is None:
+                new_alerts.append(alert)
+                continue
+
+            if (condition == ">" and price >= value) or (condition == "<" and price <= value):
+                requests.post(URL, json={
+                    "chat_id": user_id,
+                    "text": f"🔔 {asset} reached your alert target: ${price}"
+                })
+            else:
+                new_alerts.append(alert)
+
+        with open(ALERTS_FILE, "w") as f:
+            json.dump(new_alerts, f)
+
+        time.sleep(60)
+
+@app.route(f'/{SECRET_PATH}', methods=["POST"])
+def webhook():
+    data = request.get_json()
+    if "message" not in data:
+        return "ok"
+    message = data["message"]
+    chat_id = message["chat"]["id"]
+    text = message.get("text", "").strip()
+
+    if text.startswith("/start"):
+        send_message(chat_id, "👋 Hi! Ask me for any stock or crypto price. Try:\n- `btc`\n- `show apple`\n- `set alert btc 30000`")
+        return "ok"
+
+    parsed = parse_alert(text)
+    if parsed:
+        asset, cond, val = parsed
+        save_alert(chat_id, asset, cond, val)
+        send_message(chat_id, f"✅ Alert set for {asset} when it goes {'above' if cond == '>' else 'below'} ${val}")
+    else:
+        response = smart_price_lookup(text)
+        send_message(chat_id, response)
+
+    return "ok"
+
+def send_message(chat_id, text):
+    requests.post(URL, json={"chat_id": chat_id, "text": text})
+
+@app.route('/')
+def home():
+    return "Bot is running."
 
 if __name__ == "__main__":
     threading.Thread(target=check_alerts, daemon=True).start()
