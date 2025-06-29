@@ -1,4 +1,6 @@
 pyTelegramBotAPI
 Flask
 python-dotenv
+yfinance
 requests
+fuzzywuzzy
