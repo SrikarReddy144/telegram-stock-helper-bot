@@ -24,4 +24,4 @@ def webhook():
 def home():
     return "✅ MoneyMaster Bot is Running!"
 if app=="__name__":
-    app.run(port=10000,ip='0.0.0.0')
+    app.run(port=5000,ip=0.0.0.0)
