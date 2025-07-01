@@ -1,68 +1,84 @@
 import requests
-from telegram import Update
-from telegram.ext import ApplicationBuilder, CommandHandler, MessageHandler, ContextTypes, filters
+from fuzzywuzzy import fuzz, process
 
-# In-memory alerts
-alerts = {}
+# Predefined popular crypto IDs
+CRYPTO_IDS = {
+    'bitcoin': 'bitcoin',
+    'btc': 'bitcoin',
+    'eth': 'ethereum',
+    'ethereum': 'ethereum',
+    'sol': 'solana',
+    'xrp': 'ripple',
+    'doge': 'dogecoin',
+    'ada': 'cardano',
+    'matic': 'polygon',
+    'bnb': 'binancecoin',
+    'ltc': 'litecoin',
+}
 
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(
-        "👋 Hi! Ask me for any stock or crypto price.\nTry:\n- `btc`\n- `show apple`\n- `set alert btc 30000`",
-        parse_mode='Markdown'
-    )
-
-async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    msg = update.message.text.lower()
-    user_id = update.message.chat_id
-
-    if msg.startswith("set alert"):
-        parts = msg.split()
-        if len(parts) == 4:
-            symbol = parts[2].upper()
-            try:
-                target = float(parts[3])
-                alerts[user_id] = {'symbol': symbol, 'target': target}
-                await update.message.reply_text(f"📈 Alert set for {symbol} at {target}")
-                return
-            except ValueError:
-                pass
-        await update.message.reply_text("❗ Usage: set alert btc 30000")
-        return
-
-    symbol = msg.replace("show", "").strip().upper()
-    price = get_price(symbol)
-    if price:
-        await update.message.reply_text(f"💹 {symbol} price: {price}")
-    else:
-        await update.message.reply_text("❓ Sorry, I couldn't find anything for that. Try BTC, ETH, TSLA, AAPL, etc.")
-
-def get_price(symbol):
+def fetch_crypto_price(name):
+    coin_id = CRYPTO_IDS.get(name.lower())
+    if not coin_id:
+        return f"❓ Unknown crypto '{name}'"
+    
+    url = f'https://api.coingecko.com/api/v3/simple/price?ids={coin_id}&vs_currencies=usd'
     try:
-        if symbol in ['BTC', 'ETH']:
-            res = requests.get(f"https://api.coingecko.com/api/v3/simple/price?ids={symbol.lower()}&vs_currencies=usd")
-            return res.json()[symbol.lower()]["usd"]
+        r = requests.get(url, timeout=5)
+        data = r.json()
+        if coin_id in data:
+            price = data[coin_id]['usd']
+            return f"💰 {coin_id.title()} price: ${price:,}"
+    except Exception as e:
+        print("Crypto error:", e)
+    return f"❌ Error fetching crypto price for '{name}'"
+
+def fetch_stock_price(symbol):
+    url = f'https://query1.finance.yahoo.com/v8/finance/chart/{symbol.upper()}'
+    try:
+        r = requests.get(url, timeout=5)
+        data = r.json()
+        price = data['chart']['result'][0]['meta']['regularMarketPrice']
+        return f"📈 {symbol.upper()} stock price: ${price:,}"
+    except Exception:
+        return f"❌ Stock '{symbol.upper()}' not found."
+
+# Fuzzy lookup for common tickers
+# A small pre-fetched list (you can expand)
+COMMON_TICKERS = [
+    "AAPL", "TSLA", "MSFT", "AMZN", "GOOGL", "NFLX", "META", "NVDA", "INTC", "AMD",
+    "BA", "T", "V", "PYPL", "PEP", "KO", "JPM", "XOM", "CVX", "WMT", "NKE"
+]
+
+def find_closest_ticker(query):
+    result, score = process.extractOne(query.upper(), COMMON_TICKERS)
+    if score >= 80:
+        return result
+    return query.upper()
+
+def handle_user_input(msg):
+    msg = msg.strip().lower()
+
+    if msg.startswith("show "):
+        name = msg[5:].strip()
+        if name in CRYPTO_IDS:
+            return fetch_crypto_price(name)
         else:
-            res = requests.get(f"https://query1.finance.yahoo.com/v7/finance/quote?symbols={symbol}")
-            return res.json()["quoteResponse"]["result"][0]["regularMarketPrice"]
-    except:
-        return None
+            symbol = find_closest_ticker(name)
+            return fetch_stock_price(symbol)
 
-async def check_alerts(context: ContextTypes.DEFAULT_TYPE):
-    for user_id, data in alerts.items():
-        price = get_price(data['symbol'])
-        if price and ((price >= data['target']) if price < data['target'] else (price <= data['target'])):
-            await context.bot.send_message(chat_id=user_id, text=f"🚨 {data['symbol']} reached {price}!")
-            del alerts[user_id]
-            break
+    elif msg in CRYPTO_IDS:
+        return fetch_crypto_price(msg)
 
-def main():
-    app = ApplicationBuilder().token("YOUR_BOT_TOKEN").build()
+    elif msg.isalpha() or len(msg) <= 5:
+        symbol = find_closest_ticker(msg)
+        return fetch_stock_price(symbol)
 
-    app.add_handler(CommandHandler("start", start))
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
-    app.job_queue.run_repeating(check_alerts, interval=60)
+    else:
+        return "❓ Sorry, I couldn't understand. Try `btc`, `eth`, `show apple`, `show tsla`, etc."
 
-    app.run_polling()
-
+# ✅ Local test
 if __name__ == "__main__":
-    main()
+    print("💹 MoneyMaster Smart Bot (Test Mode)")
+    while True:
+        user = input("You: ")
+        print("Bot:", handle_user_input(user))
