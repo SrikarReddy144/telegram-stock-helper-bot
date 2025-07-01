@@ -1,17 +1,25 @@
-from flask import Flask, request
-import telegram
 import os
+from flask import Flask, request
+import requests
+from bot import handle_message
 
 TOKEN = os.getenv("BOT_TOKEN")
-bot = telegram.Bot(token=TOKEN)
+SECRET_PATH = os.getenv("WEBHOOK_SECRET", "secret-path")  # default secret if not set
+URL = f"https://api.telegram.org/bot{TOKEN}/sendMessage"
 
 app = Flask(__name__)
 
-@app.route(f"/{os.getenv('SECRET_PATH')}", methods=["POST"])
+@app.route(f"/{SECRET_PATH}", methods=["POST"])
 def webhook():
-    update = telegram.Update.de_json(request.get_json(force=True), bot)
-    return "ok"
+    data = request.json
+    if "message" in data and "text" in data["message"]:
+        chat_id = data["message"]["chat"]["id"]
+        user_msg = data["message"]["text"]
 
-# Optional for local testing
-if __name__ == "__main__":
-    app.run(host="0.0.0.0", port=5000)
+        reply = handle_message(user_msg)
+        requests.post(URL, json={"chat_id": chat_id, "text": reply})
+    return "OK"
+
+@app.route("/", methods=["GET"])
+def home():
+    return "✅ MoneyMaster Bot is Running!"
