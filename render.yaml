@@ -1,6 +1,7 @@
 services:
   - type: web
-    name: telegram-stock-helper-bot
+    name: stockhelperbot
     env: python
-    buildCommand: pip install -r requirements.txt
-    startCommand: python main.py
+    plan: free
+    buildCommand: ""
+    startCommand: "python app.py"
